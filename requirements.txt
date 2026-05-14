@@ -1,0 +1,6 @@
+streamlit>=1.39
+voyageai>=0.3
+groq>=0.11
+supabase>=2.9
+pymupdf>=1.24
+python-dotenv>=1.0

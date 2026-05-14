@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Ambientes
+env/
+venv/
+.venv/
+
+# Variaveis sensiveis
+.env
+.streamlit/secrets.toml
+
+# Uploads temporarios
+uploads/
+*.pdf
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
