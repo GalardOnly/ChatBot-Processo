@@ -2,10 +2,12 @@
 Cliente Supabase compartilhado entre os modulos da app.
 - Auth: sign_up, sign_in, sign_out
 - CRUD: processes, chunks (via vector.py), messages
-- Helper: cliente autenticado com o JWT do usuario logado
+- LGPD: consentimento, log de acesso, exportacao, exclusao de dados
 """
 
-from typing import List, Dict, Optional
+import json
+from datetime import datetime
+from typing import Dict, List, Optional
 
 import streamlit as st
 from supabase import create_client, Client
@@ -27,13 +29,12 @@ def _base_client() -> Client:
 
 def client() -> Client:
     """
-    Retorna um cliente Supabase. Se houver sessao na st.session_state,
-    aplica o JWT para que as policies RLS funcionem corretamente.
+    Retorna um cliente Supabase com o JWT do usuario logado.
+    As policies RLS usam auth.uid() que e resolvido pelo JWT.
     """
     c = _base_client()
     session = st.session_state.get("session")
     if session:
-        # PostgREST usa o JWT do header para resolver auth.uid()
         c.postgrest.auth(session.access_token)
     return c
 
@@ -74,19 +75,28 @@ def create_process(filename: str, total_pages: int, total_chunks: int) -> str:
         "total_pages": total_pages,
         "total_chunks": total_chunks,
     }).execute()
-    return res.data[0]["id"]
+    process_id = res.data[0]["id"]
+    # Log LGPD: upload de processo
+    _log_access(process_id=process_id, action="upload")
+    return process_id
 
 
 def list_processes() -> List[Dict]:
     res = client().table("processes") \
-        .select("id, filename, total_pages, total_chunks, created_at") \
+        .select("id, filename, total_pages, total_chunks, created_at, expires_at") \
         .order("created_at", desc=True) \
         .execute()
     return res.data or []
 
 
 def delete_process(process_id: str) -> None:
-    # RLS garante que so deleta se for do usuario; ON DELETE CASCADE limpa chunks/messages
+    """
+    Deleta um processo e todos os seus dados (chunks, mensagens).
+    ON DELETE CASCADE no schema cuida dos registros dependentes.
+    LGPD art. 18, VI: direito a eliminacao de dados.
+    """
+    _log_access(process_id=process_id, action="delete_process")
+    # RLS garante que so deleta se for do usuario
     client().table("processes").delete().eq("id", process_id).execute()
 
 
@@ -103,7 +113,13 @@ def list_messages(process_id: str) -> List[Dict]:
     return res.data or []
 
 
-def save_message(process_id: str, role: str, content: str, sources: Optional[List[Dict]] = None) -> None:
+def save_message(
+    process_id: str,
+    role: str,
+    content: str,
+    sources: Optional[List[Dict]] = None,
+    action_key: Optional[str] = None,
+) -> None:
     client().table("messages").insert({
         "user_id": current_user_id(),
         "process_id": process_id,
@@ -111,3 +127,177 @@ def save_message(process_id: str, role: str, content: str, sources: Optional[Lis
         "content": content,
         "sources": sources,
     }).execute()
+    # Log LGPD: interacao com processo
+    if role == "user":
+        log_action = f"action_{action_key}" if action_key else "chat"
+        _log_access(process_id=process_id, action=log_action)
+
+
+# ---------------------------------------------------------------------------
+# LGPD - Consentimento (LGPD art. 7, I e art. 8)
+# ---------------------------------------------------------------------------
+
+TERM_VERSION = "1.0"
+
+
+def has_accepted_lgpd() -> bool:
+    """
+    Verifica se o usuario ja aceitou o Termo de Consentimento LGPD.
+    Retorna True se houver pelo menos um registro de aceite.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return False
+    try:
+        res = client().table("lgpd_consents") \
+            .select("id") \
+            .eq("user_id", user_id) \
+            .eq("term_version", TERM_VERSION) \
+            .limit(1) \
+            .execute()
+        return len(res.data) > 0
+    except Exception:
+        # Em caso de erro (ex: tabela ainda nao criada), nao bloqueia o usuario
+        return True
+
+
+def record_lgpd_consent() -> None:
+    """
+    Registra o aceite do Termo de Consentimento LGPD pelo usuario.
+    LGPD art. 8, par. 1: o consentimento deve ser documentado.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        client().table("lgpd_consents").insert({
+            "user_id": user_id,
+            "term_version": TERM_VERSION,
+            "accepted_at": datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception:
+        pass  # Nao bloqueia o fluxo se falhar; logar em producao
+
+
+# ---------------------------------------------------------------------------
+# LGPD - Log de acesso a dados (LGPD art. 37)
+# ---------------------------------------------------------------------------
+
+def _log_access(action: str, process_id: Optional[str] = None) -> None:
+    """
+    Registra internamente uma operacao de acesso a dados no log de auditoria.
+    Chamado automaticamente pelas funcoes de CRUD.
+    Falhas sao silenciosas para nao quebrar o fluxo principal.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        record = {
+            "user_id": user_id,
+            "action": action,
+        }
+        if process_id:
+            record["process_id"] = process_id
+        client().table("data_access_log").insert(record).execute()
+    except Exception:
+        pass
+
+
+def log_action(action: str, process_id: Optional[str] = None) -> None:
+    """Versao publica de _log_access para uso externo (ex: app.py)."""
+    _log_access(action=action, process_id=process_id)
+
+
+# ---------------------------------------------------------------------------
+# LGPD - Exportacao de dados (LGPD art. 18, I e II)
+# ---------------------------------------------------------------------------
+
+def export_user_data() -> Dict:
+    """
+    Exporta todos os dados do usuario como dicionario Python.
+    Chama a funcao RPC do Supabase que monta o JSON completo.
+    LGPD art. 18, II: direito de acesso aos dados.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return {}
+    try:
+        res = client().rpc("export_user_data", {"p_user_id": user_id}).execute()
+        return res.data if res.data else {}
+    except Exception as e:
+        # Fallback: monta exportacao local se a funcao RPC nao existir ainda
+        return _export_local(user_id)
+
+
+def _export_local(user_id: str) -> Dict:
+    """Exportacao local como fallback (sem funcao RPC no banco)."""
+    try:
+        processes = list_processes()
+        all_data = {
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "user_id": user_id,
+            "processes": [],
+        }
+        for proc in processes:
+            msgs = list_messages(proc["id"])
+            proc_data = {**proc, "messages": msgs}
+            all_data["processes"].append(proc_data)
+        return all_data
+    except Exception:
+        return {"error": "Falha ao exportar dados. Tente novamente."}
+
+
+def export_user_data_json() -> str:
+    """Retorna os dados do usuario como string JSON formatada para download."""
+    data = export_user_data()
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# LGPD - Eliminacao de dados (LGPD art. 18, VI)
+# ---------------------------------------------------------------------------
+
+def request_deletion(reason: str = "") -> None:
+    """
+    Registra um pedido formal de exclusao de dados (LGPD art. 18, VI).
+    O pedido fica registrado antes de executar a exclusao.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        client().table("deletion_requests").insert({
+            "user_id": user_id,
+            "reason": reason,
+            "status": "pending",
+        }).execute()
+    except Exception:
+        pass
+
+
+def delete_all_user_data() -> bool:
+    """
+    Elimina TODOS os dados do usuario (processos, chunks, mensagens, logs).
+    Nao exclui a conta de autenticacao (precisa ser feita separadamente).
+    LGPD art. 18, VI: direito a eliminacao de dados tratados com base em consentimento.
+    Retorna True se bem-sucedido.
+    """
+    user_id = current_user_id()
+    if not user_id:
+        return False
+    try:
+        # Registra o pedido antes de executar
+        request_deletion(reason="Exclusao solicitada pelo usuario via interface")
+        # Chama a funcao RPC de exclusao
+        client().rpc("delete_user_data", {"p_user_id": user_id}).execute()
+        return True
+    except Exception:
+        # Fallback: deleta diretamente pela API
+        try:
+            client().table("processes").delete().eq("user_id", user_id).execute()
+            client().table("data_access_log").delete().eq("user_id", user_id).execute()
+            client().table("lgpd_consents").delete().eq("user_id", user_id).execute()
+            return True
+        except Exception:
+            return False
