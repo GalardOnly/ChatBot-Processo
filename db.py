@@ -6,6 +6,7 @@ Cliente Supabase compartilhado entre os modulos da app.
 """
 
 import json
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -27,11 +28,37 @@ def _base_client() -> Client:
     return create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
 
 
+def _refresh_session_if_needed() -> None:
+    """
+    Renova o token JWT se estiver a menos de 5 minutos de expirar.
+    Seguranca M2: evita que sessoes longas percam dados silenciosamente
+    quando o token expira (padrao Supabase: 1 hora).
+    """
+    session = st.session_state.get("session")
+    if not session:
+        return
+    try:
+        expires_at = getattr(session, "expires_at", None)
+        if expires_at is None:
+            return
+        # Renova se faltar menos de 5 minutos (300 segundos)
+        if time.time() > float(expires_at) - 300:
+            result = _base_client().auth.refresh_session(session.refresh_token)
+            if result and result.session:
+                st.session_state.session = result.session
+    except Exception:
+        # Falha silenciosa: a proxima chamada ao banco retornara 401
+        # e o usuario precisara fazer login novamente
+        pass
+
+
 def client() -> Client:
     """
     Retorna um cliente Supabase com o JWT do usuario logado.
+    Renova o token automaticamente se estiver proximo de expirar (M2).
     As policies RLS usam auth.uid() que e resolvido pelo JWT.
     """
+    _refresh_session_if_needed()
     c = _base_client()
     session = st.session_state.get("session")
     if session:
@@ -161,20 +188,46 @@ def has_accepted_lgpd() -> bool:
         return True
 
 
+def _get_ip_hint() -> str:
+    """
+    Retorna os primeiros 2 octetos do IP do usuario (ex: "191.26.*.*").
+    Seguranca B3: registra IP parcial para audit trail LGPD sem identificar
+    o usuario de forma exata (principio da minimizacao - LGPD art. 6, III).
+    Usa st.context.ip_address disponivel no Streamlit 1.31+.
+    """
+    try:
+        ip = getattr(st.context, "ip_address", None)
+        if not ip:
+            return ""
+        parts = str(ip).split(".")
+        if len(parts) == 4:
+            # IPv4: oculta 3o e 4o octeto
+            return f"{parts[0]}.{parts[1]}.*.*"
+        # IPv6: retorna apenas o prefixo /32
+        return str(ip)[:8] + "..."
+    except Exception:
+        return ""
+
+
 def record_lgpd_consent() -> None:
     """
     Registra o aceite do Termo de Consentimento LGPD pelo usuario.
     LGPD art. 8, par. 1: o consentimento deve ser documentado.
+    Inclui ip_hint (B3) para audit trail sem expor o IP completo.
     """
     user_id = current_user_id()
     if not user_id:
         return
     try:
-        client().table("lgpd_consents").insert({
+        record = {
             "user_id": user_id,
             "term_version": TERM_VERSION,
             "accepted_at": datetime.utcnow().isoformat(),
-        }).execute()
+        }
+        ip_hint = _get_ip_hint()
+        if ip_hint:
+            record["ip_hint"] = ip_hint
+        client().table("lgpd_consents").insert(record).execute()
     except Exception:
         pass  # Nao bloqueia o fluxo se falhar; logar em producao
 
@@ -225,7 +278,7 @@ def export_user_data() -> Dict:
     try:
         res = client().rpc("export_user_data", {"p_user_id": user_id}).execute()
         return res.data if res.data else {}
-    except Exception as e:
+    except Exception:
         # Fallback: monta exportacao local se a funcao RPC nao existir ainda
         return _export_local(user_id)
 

@@ -6,6 +6,8 @@ Rodar local:  streamlit run app.py
 Deploy:       https://share.streamlit.io
 """
 
+import time
+import logging
 import streamlit as st
 
 import config
@@ -14,6 +16,14 @@ import lgpd
 import pdf as pdf_mod
 import vector as vec
 import chat as chat_mod
+
+# ---------------------------------------------------------------------------
+# Rate Limiting (Seguranca A4)
+# Limites por sessao para evitar exaustao de cotas das APIs externas (Groq/Voyage)
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_CALLS   = 20   # maximo de chamadas LLM por janela de tempo
+_RATE_LIMIT_WINDOW  = 600  # janela em segundos (10 minutos)
+_RATE_LIMIT_UPLOADS = 5    # maximo de uploads de PDF por sessao
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +46,40 @@ def _init_state():
     st.session_state.setdefault("lgpd_accepted", False)
     st.session_state.setdefault("show_privacy", False)
     st.session_state.setdefault("confirm_delete_account", False)
+    # Rate limiting: lista de timestamps de chamadas LLM na sessao atual (A4)
+    st.session_state.setdefault("_rl_llm_calls", [])
+    st.session_state.setdefault("_rl_upload_count", 0)
+
+
+def _check_llm_rate_limit() -> bool:
+    """
+    Verifica se o usuario ainda esta dentro do limite de chamadas LLM.
+    Retorna True se a chamada e permitida, False se o limite foi atingido.
+    Seguranca A4: evita exaustao de cotas do Groq e Voyage AI.
+    """
+    now = time.time()
+    calls = [t for t in st.session_state._rl_llm_calls if now - t < _RATE_LIMIT_WINDOW]
+    if len(calls) >= _RATE_LIMIT_CALLS:
+        restante = int(_RATE_LIMIT_WINDOW - (now - min(calls)))
+        st.warning(
+            f"Limite de {_RATE_LIMIT_CALLS} consultas por 10 minutos atingido. "
+            f"Aguarde {restante // 60}m{restante % 60:02d}s para continuar."
+        )
+        return False
+    calls.append(now)
+    st.session_state._rl_llm_calls = calls
+    return True
+
+
+def _check_upload_rate_limit() -> bool:
+    """Limita o numero de uploads de PDF por sessao."""
+    if st.session_state._rl_upload_count >= _RATE_LIMIT_UPLOADS:
+        st.warning(
+            f"Limite de {_RATE_LIMIT_UPLOADS} uploads por sessao atingido. "
+            "Faca logout e login novamente para continuar."
+        )
+        return False
+    return True
 
 
 _init_state()
@@ -170,13 +214,10 @@ def render_sidebar():
                     st.session_state.pending_question = None
                     st.session_state.pending_action = None
                     st.rerun()
-                # Mostrar retencao LGPD
+                # Mostrar retencao LGPD (Seguranca M1: sem unsafe_allow_html)
                 created = proc.get("created_at", "")
                 retencao = lgpd.formatar_expiracao(created) if created else ""
-                st.caption(
-                    f"&nbsp;&nbsp;{proc['total_pages']} pgs · {retencao}",
-                    unsafe_allow_html=True,
-                )
+                st.caption(f"  {proc['total_pages']} pgs · {retencao}")
 
         st.divider()
 
@@ -304,8 +345,13 @@ def render_upload():
             )
         return
 
-    file_bytes = uploaded.getvalue()
-    size_mb = len(file_bytes) / (1024 * 1024)
+    # Seguranca M5: verificar tamanho via seek/tell ANTES de criar copia em bytes na RAM
+    # Nota: maxUploadSize=50 no config.toml ja rejeita no nivel do Streamlit (1a camada).
+    # Esta e a 2a camada, no Python, sem duplicar o arquivo em memoria desnecessariamente.
+    uploaded.seek(0, 2)           # vai para o fim do buffer
+    size_bytes = uploaded.tell()  # le a posicao = tamanho em bytes
+    uploaded.seek(0)              # volta ao inicio para leitura posterior
+    size_mb = size_bytes / (1024 * 1024)
 
     col1, col2, _ = st.columns([2, 1, 1])
     col1.metric("Arquivo", uploaded.name)
@@ -315,17 +361,31 @@ def render_upload():
         st.error(f"Arquivo acima do limite de {config.MAX_FILE_SIZE_MB} MB.")
         return
 
+    # Carrega em memoria apenas apos validar o tamanho
+    file_bytes = uploaded.getvalue()
+
     if not st.button("Analisar processo", type="primary"):
         return
 
-    _process_pdf(uploaded.name, file_bytes)
+    # Seguranca A4: verificar rate limit de uploads antes de processar
+    if not _check_upload_rate_limit():
+        return
+
+    st.session_state._rl_upload_count += 1
+    _process_pdf(_sanitize_filename(uploaded.name), file_bytes)
 
 
 def _process_pdf(filename: str, file_bytes: bytes):
     """Pipeline completo: extrair -> chunkar -> embedding -> salvar."""
     with st.status("Processando o PDF...", expanded=True) as status:
         st.write("\U0001f50d Extraindo texto pagina a pagina...")
-        pages = pdf_mod.extract_pages(file_bytes)
+        # Seguranca A1: validacao de magic bytes feita dentro de extract_pages()
+        try:
+            pages = pdf_mod.extract_pages(file_bytes)
+        except ValueError as e:
+            status.update(label="Arquivo invalido", state="error")
+            st.error(str(e))
+            return
         if not pages:
             status.update(label="Falha", state="error")
             st.error(
@@ -452,6 +512,9 @@ def _render_action_panel():
 
 
 def _answer_and_save(process_id: str, question: str):
+    # Seguranca A4: verificar rate limit antes de chamar o LLM
+    if not _check_llm_rate_limit():
+        return
     db.save_message(process_id, "user", question, action_key=None)
     with st.spinner("Pensando..."):
         answer, sources = chat_mod.answer_question(process_id, question)
@@ -459,6 +522,9 @@ def _answer_and_save(process_id: str, question: str):
 
 
 def _run_action_and_save(process_id: str, action_key: str):
+    # Seguranca A4: verificar rate limit antes de chamar o LLM
+    if not _check_llm_rate_limit():
+        return
     action = chat_mod.ACTIONS[action_key]
     user_message = f"**{action['icon']} {action['label']}**"
     db.save_message(process_id, "user", user_message, action_key=action_key)
@@ -564,15 +630,47 @@ def _render_prescricao_panel(meta: dict):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _sanitize_filename(name: str) -> str:
+    """
+    Sanitiza o nome do arquivo antes de armazenar no banco.
+    Seguranca B1: previne path traversal e caracteres especiais
+    que poderiam ser perigosos se o filename fosse usado em operacoes de arquivo.
+    - Mantem: letras, numeros, espacos, hifens, underscores, pontos e parenteses
+    - Remove: barras, contrabarra, null bytes e qualquer outro caractere especial
+    - Limita a 200 caracteres para evitar overflow em campos de texto
+    """
+    import re as _re
+    # Remover null bytes e caracteres de controle
+    name = name.replace("\x00", "").strip()
+    # Manter apenas caracteres seguros
+    name = _re.sub(r"[^\w\s\-\.\(\)\[\]#]", "_", name)
+    # Normalizar espacos multiplos
+    name = _re.sub(r"\s+", " ", name).strip()
+    # Garantir que tem extensao .pdf
+    if not name.lower().endswith(".pdf"):
+        name = name + ".pdf"
+    # Truncar se necessario
+    return name[:200] if len(name) > 200 else name
+
+
 def _friendly_error(e: Exception) -> str:
+    """
+    Converte excecoes de auth em mensagens amigaveis.
+    Seguranca M4: nunca expoe stack trace ou detalhes de infraestrutura ao usuario.
+    """
     msg = str(e)
     if "Invalid login credentials" in msg:
         return "E-mail ou senha incorretos."
     if "already registered" in msg:
-        return "Este e-mail ja esta cadastrado."
+        # M4 + B2: mensagem neutra evita enumeracao de e-mails
+        return "Nao foi possivel criar a conta com este e-mail. Tente fazer login."
     if "rate limit" in msg.lower():
-        return "Muitas tentativas. Aguarde alguns minutos."
-    return msg
+        return "Muitas tentativas. Aguarde alguns minutos e tente novamente."
+    if "email" in msg.lower() and "invalid" in msg.lower():
+        return "Endereco de e-mail invalido."
+    # Fallback generico: loga internamente sem expor ao usuario (M4)
+    logging.warning(f"[Defensor IA] Auth error (nao exibido ao usuario): {msg}")
+    return "Ocorreu um erro inesperado. Tente novamente ou entre em contato com o suporte."
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +703,7 @@ else:
         else:
             render_upload()
 
-# Rodape LGPD
+# Rodape LGPD (estatico - sem unsafe_allow_html com dados externos)
 st.markdown(
     "<div style='text-align:center;font-size:11px;color:#94a3b8;margin-top:2rem'>"
     "As respostas sao geradas por IA e devem ser revisadas por um defensor humano. "

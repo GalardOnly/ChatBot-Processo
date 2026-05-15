@@ -10,4 +10,6 @@ font = "sans serif"
 gatherUsageStats = false
 
 [server]
-maxUploadSize = 60
+# Limite de upload alinhado com config.MAX_FILE_SIZE_MB (Seguranca A1)
+# Rejeita arquivos grandes ANTES de chegarem ao Python, evitando carga desnecessaria na RAM
+maxUploadSize = 50

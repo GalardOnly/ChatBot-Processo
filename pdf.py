@@ -10,12 +10,42 @@ import fitz  # pymupdf
 
 import config
 
+# Magic bytes de PDFs validos (primeiros 4 bytes) - Seguranca A1
+_PDF_MAGIC = b'%PDF'
+# Tamanho minimo razoavel para um PDF nao corrompido
+_PDF_MIN_BYTES = 100
+
+
+def _validate_pdf_bytes(file_bytes: bytes) -> None:
+    """
+    Valida o conteudo do arquivo antes de passar ao PyMuPDF.
+    Seguranca A1: impede que arquivos maliciosos renomeados para .pdf
+    cheguem ao parser (que tem historico de CVEs).
+    Levanta ValueError com mensagem amigavel se o arquivo for invalido.
+    """
+    if len(file_bytes) < _PDF_MIN_BYTES:
+        raise ValueError(
+            "Arquivo muito pequeno ou corrompido. Verifique se o PDF esta integro."
+        )
+    max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise ValueError(
+            f"Arquivo excede o limite de {config.MAX_FILE_SIZE_MB} MB."
+        )
+    if not file_bytes.startswith(_PDF_MAGIC):
+        raise ValueError(
+            "O arquivo enviado nao e um PDF valido. "
+            "Certifique-se de enviar um PDF nao protegido por senha e nao corrompido."
+        )
+
 
 def extract_pages(file_bytes: bytes) -> List[Dict]:
     """
     Recebe o conteudo bruto do PDF e retorna [{"page_num", "text"}].
     Descarta paginas em branco / com menos de 30 chars uteis.
+    Valida magic bytes antes de abrir com PyMuPDF (seguranca A1).
     """
+    _validate_pdf_bytes(file_bytes)
     doc = fitz.open(stream=io.BytesIO(file_bytes), filetype="pdf")
     pages: List[Dict] = []
     for page_num, page in enumerate(doc, start=1):
@@ -71,7 +101,7 @@ def chunk_pages(pages: List[Dict]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 def _clean_text(text: str) -> str:
-    text = re.sub(r"(?<=[a-zA-ZÀ-ſ,;:])\n(?=[a-zA-ZÀ-ſ])", " ", text)
+    text = re.sub(r"(?<=[a-zA-Z\xC0-\xFF,;:])\n(?=[a-zA-Z\xC0-\xFF])", " ", text)
     text = re.sub(r" {2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

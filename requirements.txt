@@ -1,6 +1,11 @@
-streamlit>=1.39
-voyageai>=0.3
-groq>=0.11
-supabase>=2.9
-pymupdf>=1.24
-python-dotenv>=1.0
+# Dependencias do Defensor IA
+# Versoes fixas para builds reprodutiveis e mitigacao de supply-chain risk (M3).
+# Para atualizar: pip install -U <pacote>, testar, e ajustar a versao aqui.
+# Gerar lockfile completo com: pip freeze > requirements.lock
+
+streamlit==1.57.0
+voyageai==0.3.7
+groq==1.2.0
+supabase==2.30.0
+pymupdf==1.27.2.3
+python-dotenv==1.2.2
