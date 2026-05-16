@@ -105,15 +105,23 @@ def create_process(filename: str, total_pages: int, total_chunks: int) -> str:
     process_id = res.data[0]["id"]
     # Log LGPD: upload de processo
     _log_access(process_id=process_id, action="upload")
+    _list_processes_cached.clear()  # invalida cache
     return process_id
 
 
-def list_processes() -> List[Dict]:
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_processes_cached(user_id: str) -> List[Dict]:
     res = client().table("processes") \
         .select("id, filename, total_pages, total_chunks, created_at, expires_at") \
         .order("created_at", desc=True) \
         .execute()
     return res.data or []
+
+
+def list_processes() -> List[Dict]:
+    """Lista processos do usuario (cache 30s)."""
+    user_id = current_user_id() or ""
+    return _list_processes_cached(user_id)
 
 
 def delete_process(process_id: str) -> None:
@@ -125,18 +133,16 @@ def delete_process(process_id: str) -> None:
     _log_access(process_id=process_id, action="delete_process")
     # RLS garante que so deleta se for do usuario
     client().table("processes").delete().eq("id", process_id).execute()
+    _list_processes_cached.clear()  # invalida cache
+    _list_messages_cached.clear()
 
 
 # ---------------------------------------------------------------------------
 # Messages (historico de chat)
 # ---------------------------------------------------------------------------
 
-def list_messages(process_id: str) -> List[Dict]:
-    """
-    Lista mensagens do processo com o feedback do usuario embutido.
-    Cada item tem chave 'my_feedback' = {'rating', 'comment'} ou None.
-    """
-    user_id = current_user_id()
+@st.cache_data(ttl=10, show_spinner=False)
+def _list_messages_cached(process_id: str, user_id: str) -> List[Dict]:
     res = client().table("messages") \
         .select("id, role, content, sources, action_key, created_at, "
                 "message_feedback(rating, comment, user_id)") \
@@ -145,7 +151,6 @@ def list_messages(process_id: str) -> List[Dict]:
         .execute()
     rows = res.data or []
     for r in rows:
-        # Filtra feedbacks: so o do usuario logado importa para UI
         fbs = r.pop("message_feedback", None) or []
         mine = next((fb for fb in fbs if fb.get("user_id") == user_id), None)
         r["my_feedback"] = (
@@ -153,6 +158,15 @@ def list_messages(process_id: str) -> List[Dict]:
             if mine else None
         )
     return rows
+
+
+def list_messages(process_id: str) -> List[Dict]:
+    """
+    Lista mensagens do processo com o feedback do usuario embutido (cache 10s).
+    Cada item tem chave 'my_feedback' = {'rating', 'comment'} ou None.
+    """
+    user_id = current_user_id() or ""
+    return _list_messages_cached(process_id, user_id)
 
 
 def save_message(
@@ -178,6 +192,7 @@ def save_message(
     if role == "user":
         log_action = f"action_{action_key}" if action_key else "chat"
         _log_access(process_id=process_id, action=log_action)
+    _list_messages_cached.clear()  # invalida cache
     return msg_id
 
 
@@ -411,16 +426,23 @@ def create_jurisprudence(
     res = client().table("jurisprudence").insert(record).execute()
     juris_id = res.data[0]["id"]
     _log_access(action="add_jurisprudence")
+    _list_jurisprudence_cached.clear()  # invalida cache
     return juris_id
 
 
-def list_jurisprudence() -> List[Dict]:
-    """Lista as pecas visiveis ao usuario (pessoais + globais)."""
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_jurisprudence_cached(user_id: str) -> List[Dict]:
     res = client().table("jurisprudence") \
         .select("id, user_id, title, court, case_number, rapporteur, judgment_date, tags, total_chunks, created_at") \
         .order("created_at", desc=True) \
         .execute()
     return res.data or []
+
+
+def list_jurisprudence() -> List[Dict]:
+    """Lista as pecas visiveis ao usuario (cache 30s)."""
+    user_id = current_user_id() or ""
+    return _list_jurisprudence_cached(user_id)
 
 
 def get_jurisprudence(juris_id: str) -> Optional[Dict]:
@@ -437,6 +459,7 @@ def delete_jurisprudence(juris_id: str) -> None:
     """Deleta uma peca (cascade limpa os chunks). RLS impede deletar globais."""
     _log_access(action="delete_jurisprudence")
     client().table("jurisprudence").delete().eq("id", juris_id).execute()
+    _list_jurisprudence_cached.clear()  # invalida cache
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +494,7 @@ def save_feedback(
             .upsert(payload, on_conflict="message_id,user_id") \
             .execute()
         _log_access(action=f"feedback_{rating}")
+        _list_messages_cached.clear()  # invalida cache
     except Exception:
         pass
 
@@ -487,5 +511,6 @@ def delete_feedback(message_id: int) -> None:
             .eq("user_id", user_id) \
             .execute()
         _log_access(action="feedback_remove")
+        _list_messages_cached.clear()  # invalida cache
     except Exception:
         pass
