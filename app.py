@@ -16,6 +16,7 @@ import lgpd
 import pdf as pdf_mod
 import vector as vec
 import chat as chat_mod
+import security
 
 # ---------------------------------------------------------------------------
 # Rate Limiting (Seguranca A4)
@@ -52,34 +53,67 @@ def _init_state():
     # Rate limiting: lista de timestamps de chamadas LLM na sessao atual (A4)
     st.session_state.setdefault("_rl_llm_calls", [])
     st.session_state.setdefault("_rl_upload_count", 0)
+    st.session_state.setdefault("user_status", None)  # P2.9: 'approved'/'pending'/'rejected'
 
 
 def _check_llm_rate_limit() -> bool:
     """
-    Verifica se o usuario ainda esta dentro do limite de chamadas LLM.
-    Retorna True se a chamada e permitida, False se o limite foi atingido.
-    Seguranca A4: evita exaustao de cotas do Groq e Voyage AI.
+    P1.6: rate limit no BANCO (por user_id), resistente a refresh, nova
+    aba ou nova sessao. Tambem mantem o backup por sessao (fail-closed
+    extra) ja existente.
     """
+    # Backup por sessao (defesa em profundidade)
     now = time.time()
     calls = [t for t in st.session_state._rl_llm_calls if now - t < _RATE_LIMIT_WINDOW]
     if len(calls) >= _RATE_LIMIT_CALLS:
         restante = int(_RATE_LIMIT_WINDOW - (now - min(calls)))
         st.warning(
-            f"Limite de {_RATE_LIMIT_CALLS} consultas por 10 minutos atingido. "
-            f"Aguarde {restante // 60}m{restante % 60:02d}s para continuar."
+            f"Limite por sessao atingido. "
+            f"Aguarde {restante // 60}m{restante % 60:02d}s."
         )
         return False
+
+    # Camada principal: banco
+    result = db.check_rate_limit_db(
+        "llm_call",
+        config.RATE_LIMIT_CHAT_MAX,
+        config.RATE_LIMIT_CHAT_WIN_S,
+    )
+    if not result.get("allowed", False):
+        retry = int(result.get("retry_after_s", config.RATE_LIMIT_CHAT_WIN_S))
+        st.warning(
+            f"Limite de {result.get('max', config.RATE_LIMIT_CHAT_MAX)} consultas "
+            f"por {config.RATE_LIMIT_CHAT_WIN_S // 60} minutos atingido. "
+            f"Aguarde {retry // 60}m{retry % 60:02d}s."
+        )
+        return False
+
     calls.append(now)
     st.session_state._rl_llm_calls = calls
     return True
 
 
 def _check_upload_rate_limit() -> bool:
-    """Limita o numero de uploads de PDF por sessao."""
+    """P1.6: rate limit no BANCO + backup por sessao."""
+    # Backup por sessao
     if st.session_state._rl_upload_count >= _RATE_LIMIT_UPLOADS:
         st.warning(
-            f"Limite de {_RATE_LIMIT_UPLOADS} uploads por sessao atingido. "
+            f"Limite de uploads por sessao atingido. "
             "Faca logout e login novamente para continuar."
+        )
+        return False
+
+    # Camada principal: banco
+    result = db.check_rate_limit_db(
+        "pdf_upload",
+        config.RATE_LIMIT_UPLOAD_MAX,
+        config.RATE_LIMIT_UPLOAD_WIN_S,
+    )
+    if not result.get("allowed", False):
+        retry = int(result.get("retry_after_s", config.RATE_LIMIT_UPLOAD_WIN_S))
+        st.warning(
+            f"Limite de {result.get('max', config.RATE_LIMIT_UPLOAD_MAX)} uploads "
+            f"por hora atingido. Aguarde {retry // 60} minutos."
         )
         return False
     return True
@@ -115,19 +149,49 @@ def render_auth():
     with tab_signup:
         with st.form("signup"):
             email = st.text_input("E-mail", key="su_email")
-            password = st.text_input("Senha", type="password", key="su_pw",
-                                     help="Use uma senha forte. Minimo 8 caracteres.")
+            password = st.text_input(
+                "Senha", type="password", key="su_pw",
+                help=(
+                    f"Minimo {config.MIN_PASSWORD_LEN} caracteres. "
+                    "A senha sera checada contra vazamentos conhecidos."
+                ),
+            )
             password2 = st.text_input("Confirme a senha", type="password", key="su_pw2")
+            allowed_dom = config.ALLOWED_EMAIL_DOMAINS
+            if allowed_dom:
+                st.caption(
+                    "Cadastro automatico apenas para dominios: "
+                    + ", ".join(allowed_dom)
+                    + ". Outros e-mails ficam aguardando aprovacao."
+                )
+            elif config.REQUIRE_ADMIN_APPROVAL:
+                st.caption("Apos o cadastro, sua conta ficara pendente de aprovacao.")
             submitted = st.form_submit_button("Criar conta", type="primary", use_container_width=True)
         if submitted:
             if password != password2:
                 st.error("As senhas nao conferem.")
-            elif len(password) < 8:
-                st.error("A senha precisa ter pelo menos 8 caracteres.")
+            elif len(password) < config.MIN_PASSWORD_LEN:
+                # P2.7: senha minima 12 chars
+                st.error(
+                    f"A senha precisa ter pelo menos {config.MIN_PASSWORD_LEN} caracteres."
+                )
+            elif config.HIBP_CHECK_ENABLED and security.is_password_pwned(password):
+                # P2.8: HIBP k-anonymity SHA-1
+                st.error(
+                    "Esta senha consta em vazamentos publicos conhecidos. "
+                    "Por seguranca, escolha outra senha que voce nunca usou em "
+                    "outros servicos."
+                )
             else:
                 try:
                     db.sign_up(email, password)
-                    st.success("Conta criada. Faca login.")
+                    # A criacao de user_status acontece no proximo login
+                    # via get_or_create_user_status() (P2.9)
+                    st.success(
+                        "Conta criada. Faca login. "
+                        "Se seu dominio nao esta na whitelist, voce ficara "
+                        "aguardando aprovacao de um administrador."
+                    )
                 except Exception as e:
                     st.error(f"Falha no cadastro: {_friendly_error(e)}")
 
@@ -138,6 +202,40 @@ def render_auth():
         "LGPD (Lei 13.709/2018). Seus dados sao usados exclusivamente para apoio "
         "ao Defensor Publico na analise de processos judiciais."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tela de aprovacao pendente (P2.9 - whitelist de dominio / admin approval)
+# ---------------------------------------------------------------------------
+
+def render_pending_approval():
+    """
+    Mostrada para usuarios que se cadastraram mas ainda nao foram aprovados.
+    O acesso a analise de processos fica bloqueado ate aprovacao manual.
+    """
+    st.title("\u23f3 Aguardando aprovacao")
+    user_email = st.session_state.session.user.email
+    st.warning(
+        f"Sua conta (**{security.safe_text(user_email)}**) esta pendente de aprovacao "
+        "por um administrador.\n\n"
+        "O acesso a analise de processos jurídicos esta restrito a Defensores "
+        "Publicos identificados. Voce sera notificado por e-mail quando sua "
+        "conta for aprovada."
+    )
+
+    allowed = config.ALLOWED_EMAIL_DOMAINS
+    if allowed:
+        st.info(
+            "Cadastros automaticos sao liberados apenas para os dominios: "
+            + ", ".join(f"`{d}`" for d in allowed)
+        )
+
+    st.divider()
+    if st.button("Sair", use_container_width=False):
+        db.sign_out()
+        st.session_state.session = None
+        st.session_state.user_status = None
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +595,13 @@ def render_chat():
 
             if msg["role"] == "assistant":
                 if msg.get("sources"):
-                    chunk_sources = [s for s in msg["sources"] if s.get("type") != "prescricao_engine"]
+                    review_meta = _get_review_meta(msg["sources"])
+                    if review_meta:
+                        _render_review_badge(review_meta)
+                    chunk_sources = [
+                        s for s in msg["sources"]
+                        if s.get("type") not in ("prescricao_engine", "reviewer_meta")
+                    ]
                     if chunk_sources:
                         _render_sources(chunk_sources)
                 _render_feedback_buttons(msg)
@@ -556,8 +660,50 @@ def _render_sources(sources):
             score = s.get("score", 0)
             st.markdown(
                 f"**fls. {s['page_num']}** · similaridade {score:.2f}\n\n"
-                f"> {s['excerpt']}"
+                f"> {security.safe_text(s['excerpt'])}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Badge de revisao automatica (LLM-as-judge)
+# ---------------------------------------------------------------------------
+
+def _get_review_meta(sources: list) -> dict | None:
+    for s in sources:
+        if isinstance(s, dict) and s.get("type") == "reviewer_meta":
+            return s
+    return None
+
+
+_REVIEW_LEVELS = {
+    "low":    ("\u2705", "success", "Revisada por IA auditora · risco baixo"),
+    "medium": ("\u26a0\ufe0f", "warning", "Revisada por IA auditora · risco medio"),
+    "high":   ("\U0001f6a8", "error",   "Resposta bloqueada pela revisao automatica"),
+}
+
+
+def _render_review_badge(meta: dict):
+    """
+    Exibe um pequeno indicador do resultado da revisao. Nao mostra a resposta
+    bruta - corrected_answer ja substituiu a original no banco.
+    """
+    risk = (meta.get("risk_level") or "high").lower()
+    approved = bool(meta.get("approved"))
+    icon, level, default_label = _REVIEW_LEVELS.get(risk, _REVIEW_LEVELS["high"])
+
+    if approved:
+        label = default_label
+        msg_fn = getattr(st, level, st.info)
+    else:
+        label = "\U0001f6a8 Resposta bloqueada pela revisao automatica"
+        msg_fn = st.error
+
+    issues = meta.get("issues") or []
+    if issues:
+        issue_str = ", ".join(f"`{i}`" for i in issues[:6])
+        msg_fn(f"{label}  ·  Issues: {issue_str}")
+    else:
+        msg_fn(label)
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +768,7 @@ def _render_feedback_buttons(msg: dict):
     # Mostra comentario antigo se existir
     if current and current.get("comment"):
         with st.expander("Seu comentario", expanded=False):
-            st.caption(current["comment"])
+            st.caption(security.safe_text(current["comment"]))
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +901,7 @@ def render_library():
 
         with st.container(border=True):
             top_left, top_right = st.columns([5, 1])
-            top_left.markdown(f"**{p['title']}**")
+            top_left.markdown(f"**{security.safe_text(p['title'])}**")
             top_right.caption(owner_label)
             if ref_line:
                 st.caption(ref_line)
@@ -943,7 +1089,7 @@ def render_view_jurisprudence():
         return
 
     col1, col2 = st.columns([4, 1])
-    col1.title(peca["title"])
+    col1.title(security.safe_text(peca["title"]))
     if col2.button("Voltar", use_container_width=True):
         st.session_state.view = "library"
         st.session_state.juris_view_id = None
@@ -1017,7 +1163,7 @@ def _friendly_error(e: Exception) -> str:
     if "email" in msg.lower() and "invalid" in msg.lower():
         return "Endereco de e-mail invalido."
     # Fallback generico: loga internamente sem expor ao usuario (M4)
-    logging.warning(f"[Defensor IA] Auth error (nao exibido ao usuario): {msg}")
+    security.safe_log_warning("[Defensor IA] Auth error", msg)
     return "Ocorreu um erro inesperado. Tente novamente ou entre em contato com o suporte."
 
 
@@ -1030,13 +1176,22 @@ if not st.session_state.session:
     render_auth()
 
 else:
-    # Autenticado: verificar consentimento LGPD antes de qualquer tela
-    if not st.session_state.lgpd_accepted:
-        st.session_state.lgpd_accepted = db.has_accepted_lgpd()
+    # P2.9: verifica status de aprovacao do usuario
+    if st.session_state.get("user_status") is None:
+        st.session_state.user_status = db.get_or_create_user_status(
+            allowed_domains=config.ALLOWED_EMAIL_DOMAINS,
+        )
 
-    if not st.session_state.lgpd_accepted:
-        # Primeira vez ou nova versao do termo: exige aceite
-        render_lgpd_consent()
+    if st.session_state.user_status != "approved":
+        render_pending_approval()
+
+    # Autenticado e aprovado: verificar consentimento LGPD antes de qualquer tela
+    elif not st.session_state.lgpd_accepted:
+        st.session_state.lgpd_accepted = db.has_accepted_lgpd()
+        if not st.session_state.lgpd_accepted:
+            render_lgpd_consent()
+        else:
+            st.rerun()
 
     elif st.session_state.get("show_privacy"):
         # Tela dedicada do Aviso de Privacidade

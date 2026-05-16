@@ -12,6 +12,7 @@ from groq import Groq
 
 import config
 import prescricao as presc_engine
+import reviewer
 from vector import search_chunks
 
 
@@ -167,7 +168,6 @@ ACTIONS: Dict[str, Dict] = {
 
 def answer_question(process_id: str, question: str) -> Tuple[str, List[Dict]]:
     """Responde a uma pergunta livre sobre o processo."""
-    # Seguranca A2: sanitizar e limitar input antes de inserir no prompt
     question = question.strip()
     if not question:
         return ("Por favor, digite uma pergunta.", [])
@@ -189,6 +189,8 @@ def answer_question(process_id: str, question: str) -> Tuple[str, List[Dict]]:
         top_k=None,
         use_jurisprudence=True,
         jurisprudence_top_k=4,
+        task_type="chat",
+        original_question=question,
     )
 
 
@@ -209,6 +211,7 @@ def run_action(process_id: str, action_key: str) -> Tuple[str, List[Dict]]:
         top_k=action["top_k"],
         use_jurisprudence=action.get("use_jurisprudence", False),
         jurisprudence_top_k=action.get("jurisprudence_top_k", 5),
+        task_type=action_key,
     )
 
 
@@ -274,13 +277,21 @@ def _run_prescricao(process_id: str, action: Dict) -> Tuple[str, List[Dict]]:
             {"role": "user", "content": user_msg},
         ],
     )
-    answer = response.choices[0].message.content.strip()
+    raw_answer = response.choices[0].message.content.strip()
 
-    # Sources: chunks normais + metadados do motor como item especial
+    # Revisao automatica - mesma regra do _run_with_context
+    review = reviewer.review_ai_answer(
+        raw_answer=raw_answer,
+        context_chunks=chunks,
+        question=None,
+        task_type="prescricao",
+    )
+
     sources = _build_sources(chunks)
     sources.insert(0, presc_engine.serializar(resultado))  # motor metadata primeiro
+    sources.insert(0, _review_meta_source(review))         # revisor metadata segundo
 
-    return answer, sources
+    return review["corrected_answer"], sources
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +305,8 @@ def _run_with_context(
     top_k: Optional[int],
     use_jurisprudence: bool = False,
     jurisprudence_top_k: int = 5,
+    task_type: str = "chat",
+    original_question: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     chunks = search_chunks(process_id, search_query, top_k=top_k)
     if not chunks:
@@ -325,8 +338,22 @@ def _run_with_context(
             {"role": "user", "content": user_msg},
         ],
     )
-    answer = response.choices[0].message.content.strip()
-    return answer, _build_sources(chunks)
+    raw_answer = response.choices[0].message.content.strip()
+
+    # === CAMADA DE REVISAO AUTOMATICA (LLM-as-judge) ===
+    # Decisao de seguranca: SEMPRE passar a resposta pela revisao antes
+    # de devolver ao caller. corrected_answer e o que o defensor le.
+    review = reviewer.review_ai_answer(
+        raw_answer=raw_answer,
+        context_chunks=chunks,
+        question=original_question,
+        task_type=task_type,
+        jurisprudence_chunks=juris_chunks if use_jurisprudence else None,
+    )
+
+    sources = _build_sources(chunks)
+    sources.insert(0, _review_meta_source(review))
+    return review["corrected_answer"], sources
 
 
 def _build_sources(chunks: List[Dict]) -> List[Dict]:
@@ -377,3 +404,17 @@ def _format_jurisprudence(chunks: List[Dict]) -> str:
         parts.append(f"[Ref {i}] {title}" + (f" - {ref}" if ref else "") + f"\n{c['text']}")
     parts.append(footer)
     return "\n\n---\n\n".join(parts)
+
+
+def _review_meta_source(review: Dict) -> Dict:
+    """
+    Empacota metadados da revisao como source especial (type='reviewer_meta').
+    Permite a UI exibir badge de risco / issues sem expor logs.
+    """
+    return {
+        "type": "reviewer_meta",
+        "approved": review.get("approved", False),
+        "risk_level": review.get("risk_level", "high"),
+        "issues": review.get("issues", []),
+        "confidence": review.get("confidence", "low"),
+    }

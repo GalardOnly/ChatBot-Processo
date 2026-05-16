@@ -14,26 +14,50 @@ import streamlit as st
 from supabase import create_client, Client
 
 import config
+import security
 
 
 # ---------------------------------------------------------------------------
 # Cliente base (anon) + cliente autenticado
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def _base_client() -> Client:
+# ---------------------------------------------------------------------------
+# Cliente Supabase: ISOLADO POR SESSAO (Audit C1 - race condition fix)
+#
+# Decisao de seguranca: NAO usar @st.cache_resource para o cliente, porque
+# postgrest.auth(token) MUTA o cliente compartilhado. Sob sessoes concorrentes
+# o JWT do usuario B pode "vazar" para a requisicao do usuario A, fazendo a
+# query rodar com permissoes erradas. Mantemos um cliente por sessao em
+# st.session_state, recriando-o quando o token muda.
+# ---------------------------------------------------------------------------
+
+_ANON_CLIENT_KEY  = "_supabase_anon_client"   # nunca recebe auth() - read-only public
+_AUTH_CLIENT_KEY  = "_supabase_auth_client"   # vinculado ao JWT desta sessao
+_AUTH_TOKEN_KEY   = "_supabase_auth_token"    # token usado pela ultima vez
+
+
+def _ensure_supabase_configured() -> None:
     if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
         st.error("Configure SUPABASE_URL e SUPABASE_ANON_KEY em .streamlit/secrets.toml")
         st.stop()
-    return create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+
+
+def anon_client() -> Client:
+    """
+    Cliente anonimo (sem JWT). Usado APENAS para login/signup/refresh
+    e operacoes que dependem da policy 'public'. Mantido por sessao para
+    nao recriar a cada chamada.
+    """
+    _ensure_supabase_configured()
+    c = st.session_state.get(_ANON_CLIENT_KEY)
+    if c is None:
+        c = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+        st.session_state[_ANON_CLIENT_KEY] = c
+    return c
 
 
 def _refresh_session_if_needed() -> None:
-    """
-    Renova o token JWT se estiver a menos de 5 minutos de expirar.
-    Seguranca M2: evita que sessoes longas percam dados silenciosamente
-    quando o token expira (padrao Supabase: 1 hora).
-    """
+    """Renova JWT se faltar menos de 5 minutos."""
     session = st.session_state.get("session")
     if not session:
         return
@@ -41,29 +65,41 @@ def _refresh_session_if_needed() -> None:
         expires_at = getattr(session, "expires_at", None)
         if expires_at is None:
             return
-        # Renova se faltar menos de 5 minutos (300 segundos)
         if time.time() > float(expires_at) - 300:
-            result = _base_client().auth.refresh_session(session.refresh_token)
+            result = anon_client().auth.refresh_session(session.refresh_token)
             if result and result.session:
                 st.session_state.session = result.session
-    except Exception:
-        # Falha silenciosa: a proxima chamada ao banco retornara 401
-        # e o usuario precisara fazer login novamente
-        pass
+                # token mudou -> invalida cliente autenticado para recriar
+                st.session_state.pop(_AUTH_CLIENT_KEY, None)
+                st.session_state.pop(_AUTH_TOKEN_KEY, None)
+    except Exception as e:
+        security.safe_log_warning("[db] refresh JWT falhou", e)
 
 
 def client() -> Client:
     """
-    Retorna um cliente Supabase com o JWT do usuario logado.
-    Renova o token automaticamente se estiver proximo de expirar (M2).
-    As policies RLS usam auth.uid() que e resolvido pelo JWT.
+    Cliente autenticado da sessao atual. Cada usuario tem o seu, armazenado
+    em st.session_state (NAO em cache global). Se nao houver sessao, cai no
+    cliente anonimo (que so passara em queries com policy public).
     """
+    _ensure_supabase_configured()
     _refresh_session_if_needed()
-    c = _base_client()
+
     session = st.session_state.get("session")
-    if session:
-        c.postgrest.auth(session.access_token)
-    return c
+    if not session:
+        return anon_client()
+
+    token = session.access_token
+    cached_token = st.session_state.get(_AUTH_TOKEN_KEY)
+    cached = st.session_state.get(_AUTH_CLIENT_KEY)
+
+    # Recria se: cliente nunca foi criado OU token mudou (refresh)
+    if cached is None or cached_token != token:
+        cached = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+        cached.postgrest.auth(token)
+        st.session_state[_AUTH_CLIENT_KEY] = cached
+        st.session_state[_AUTH_TOKEN_KEY]  = token
+    return cached
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +107,16 @@ def client() -> Client:
 # ---------------------------------------------------------------------------
 
 def sign_up(email: str, password: str):
-    return _base_client().auth.sign_up({"email": email, "password": password})
+    return anon_client().auth.sign_up({"email": email, "password": password})
 
 
 def sign_in(email: str, password: str):
-    return _base_client().auth.sign_in_with_password({"email": email, "password": password})
+    return anon_client().auth.sign_in_with_password({"email": email, "password": password})
 
 
 def sign_out():
     try:
-        _base_client().auth.sign_out()
+        anon_client().auth.sign_out()
     except Exception:
         pass
 
@@ -176,23 +212,46 @@ def save_message(
     sources: Optional[List[Dict]] = None,
     action_key: Optional[str] = None,
 ) -> int:
-    """Insere uma mensagem e retorna o id (bigint) gerado."""
-    payload = {
-        "user_id": current_user_id(),
-        "process_id": process_id,
-        "role": role,
-        "content": content,
-        "sources": sources,
-    }
-    if action_key:
-        payload["action_key"] = action_key
-    res = client().table("messages").insert(payload).execute()
-    msg_id = res.data[0]["id"] if res.data else None
-    # Log LGPD: interacao com processo
-    if role == "user":
+    """
+    Insere uma mensagem e retorna o id (bigint) gerado.
+
+    Audit P1.5: mensagens de role='assistant' SEMPRE passam pela RPC
+    save_assistant_message (SECURITY DEFINER) - o cliente nao pode inserir
+    diretamente porque a policy de INSERT da tabela messages so aceita
+    role='user'. Isso impede que um usuario forje respostas falsas no
+    proprio historico via PostgREST.
+    """
+    msg_id = None
+
+    if role == "assistant":
+        # Insercao via RPC controlada (security definer no banco)
+        res = client().rpc("save_assistant_message", {
+            "p_process_id": process_id,
+            "p_content":    content,
+            "p_sources":    sources,
+            "p_action_key": action_key,
+        }).execute()
+        msg_id = res.data if isinstance(res.data, int) else (
+            res.data[0] if isinstance(res.data, list) and res.data else None
+        )
+    elif role == "user":
+        payload = {
+            "user_id":    current_user_id(),
+            "process_id": process_id,
+            "role":       "user",
+            "content":    content,
+            "sources":    sources,
+        }
+        if action_key:
+            payload["action_key"] = action_key
+        res = client().table("messages").insert(payload).execute()
+        msg_id = res.data[0]["id"] if res.data else None
         log_action = f"action_{action_key}" if action_key else "chat"
         _log_access(process_id=process_id, action=log_action)
-    _list_messages_cached.clear()  # invalida cache
+    else:
+        raise ValueError(f"role invalido: {role!r}")
+
+    _list_messages_cached.clear()
     return msg_id
 
 
@@ -206,7 +265,10 @@ TERM_VERSION = "1.0"
 def has_accepted_lgpd() -> bool:
     """
     Verifica se o usuario ja aceitou o Termo de Consentimento LGPD.
-    Retorna True se houver pelo menos um registro de aceite.
+
+    Audit P1.2: FAIL-CLOSED. Em qualquer falha (rede, tabela inexistente,
+    timeout), retorna False - melhor pedir consentimento de novo do que
+    liberar acesso a dados sensiveis sem registro de aceite.
     """
     user_id = current_user_id()
     if not user_id:
@@ -218,10 +280,10 @@ def has_accepted_lgpd() -> bool:
             .eq("term_version", TERM_VERSION) \
             .limit(1) \
             .execute()
-        return len(res.data) > 0
-    except Exception:
-        # Em caso de erro (ex: tabela ainda nao criada), nao bloqueia o usuario
-        return True
+        return bool(res.data) and len(res.data) > 0
+    except Exception as e:
+        security.safe_log_error("[LGPD] falha ao consultar consentimento", e)
+        return False  # fail-closed: nao libera acesso em caso de erro
 
 
 def _get_ip_hint() -> str:
@@ -514,3 +576,59 @@ def delete_feedback(message_id: int) -> None:
         _list_messages_cached.clear()  # invalida cache
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Rate limit no banco (Audit P1.6 / M4)
+# ---------------------------------------------------------------------------
+
+def check_rate_limit_db(action: str, max_calls: int, window_s: int) -> Dict:
+    """
+    Verifica e registra atomicamente uma chamada de acao no banco.
+    Resiste a refresh, nova aba ou nova sessao (rate limit por user_id).
+
+    Retorna dict {allowed: bool, count: int, max: int, retry_after_s: int}.
+    Em caso de falha de rede, retorna allowed=False (fail-closed) para
+    nao virar bypass acidental.
+    """
+    try:
+        res = client().rpc("check_and_record_rate_limit", {
+            "p_action":    action,
+            "p_max_calls": max_calls,
+            "p_window_s":  window_s,
+        }).execute()
+        if isinstance(res.data, dict):
+            return res.data
+        # PostgREST as vezes retorna como string JSON
+        if isinstance(res.data, str):
+            import json as _json
+            try:
+                return _json.loads(res.data)
+            except Exception:
+                pass
+    except Exception as e:
+        security.safe_log_warning("[rate_limit] falha na RPC", e)
+    return {"allowed": False, "count": 0, "max": max_calls,
+            "retry_after_s": window_s, "error": True}
+
+
+# ---------------------------------------------------------------------------
+# User status: aprovacao por whitelist de dominio ou admin (Audit P2.9)
+# ---------------------------------------------------------------------------
+
+def get_or_create_user_status(allowed_domains: Optional[List[str]] = None) -> str:
+    """
+    Verifica o status do usuario no primeiro acesso. Cria registro como
+    'approved' se o dominio do email estiver na whitelist, ou 'pending'
+    caso contrario. Retorna 'approved' | 'pending' | 'rejected'.
+
+    Em falha, retorna 'pending' (fail-closed - LGPD/seguranca).
+    """
+    try:
+        res = client().rpc("get_or_create_user_status", {
+            "p_allowed_domains": allowed_domains or [],
+        }).execute()
+        return str(res.data or "pending")
+    except Exception as e:
+        security.safe_log_warning("[user_status] falha na RPC", e)
+        return "pending"
