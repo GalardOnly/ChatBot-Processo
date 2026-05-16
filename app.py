@@ -46,6 +46,9 @@ def _init_state():
     st.session_state.setdefault("lgpd_accepted", False)
     st.session_state.setdefault("show_privacy", False)
     st.session_state.setdefault("confirm_delete_account", False)
+    # Biblioteca de jurisprudencia
+    st.session_state.setdefault("view", "main")  # main | library | add_jurisprudence
+    st.session_state.setdefault("juris_view_id", None)
     # Rate limiting: lista de timestamps de chamadas LLM na sessao atual (A4)
     st.session_state.setdefault("_rl_llm_calls", [])
     st.session_state.setdefault("_rl_upload_count", 0)
@@ -194,6 +197,7 @@ def render_sidebar():
             st.session_state.selected_process = None
             st.session_state.pending_question = None
             st.session_state.pending_action = None
+            st.session_state.view = "main"
             st.rerun()
 
         st.divider()
@@ -213,6 +217,7 @@ def render_sidebar():
                     st.session_state.selected_process = proc
                     st.session_state.pending_question = None
                     st.session_state.pending_action = None
+                    st.session_state.view = "main"
                     st.rerun()
                 # Mostrar retencao LGPD (Seguranca M1: sem unsafe_allow_html)
                 created = proc.get("created_at", "")
@@ -220,6 +225,15 @@ def render_sidebar():
                 st.caption(f"  {proc['total_pages']} pgs · {retencao}")
 
         st.divider()
+
+        # Biblioteca de jurisprudencia
+        if st.button("\U0001f4da Biblioteca de jurisprudencia",
+                     use_container_width=True,
+                     help="Sua colecao de acordaos, sumulas e precedentes anexados"):
+            st.session_state.view = "library"
+            st.session_state.selected_process = None
+            st.session_state.juris_view_id = None
+            st.rerun()
 
         # SECAO LGPD: Seus Dados
         _render_sidebar_lgpd()
@@ -627,6 +641,272 @@ def _render_prescricao_panel(meta: dict):
 
 
 # ---------------------------------------------------------------------------
+# Telas da Biblioteca de Jurisprudencia
+# ---------------------------------------------------------------------------
+
+def render_library():
+    """Lista a biblioteca de jurisprudencia (pessoal + global) do usuario."""
+    col1, col2 = st.columns([3, 1])
+    col1.title("\U0001f4da Biblioteca de jurisprudencia")
+    if col2.button("+ Adicionar peca", use_container_width=True, type="primary"):
+        st.session_state.view = "add_jurisprudence"
+        st.rerun()
+
+    st.caption(
+        "Pecas anexadas (acordaos, sumulas, REsp, HC, etc.) sao usadas pelo "
+        "RAG para fundamentar respostas. Sem peca anexada, o assistente NAO "
+        "cita jurisprudencia (anti-alucinacao)."
+    )
+
+    pecas = db.list_jurisprudence()
+    if not pecas:
+        st.info(
+            "Sua biblioteca esta vazia. Clique em **+ Adicionar peca** para colar "
+            "um acordao ou subir o PDF da peca."
+        )
+        return
+
+    # Filtro simples
+    q = st.text_input("Filtrar por titulo / tribunal / numero", "")
+    if q:
+        ql = q.lower()
+        pecas = [p for p in pecas if
+                 ql in (p.get("title") or "").lower()
+                 or ql in (p.get("court") or "").lower()
+                 or ql in (p.get("case_number") or "").lower()]
+
+    user_id = db.current_user_id()
+    for p in pecas:
+        is_global = p.get("user_id") is None
+        owner_label = "\U0001f310 Global" if is_global else "\U0001f464 Sua"
+        court = p.get("court") or ""
+        case = p.get("case_number") or ""
+        date = p.get("judgment_date") or ""
+        rap = p.get("rapporteur") or ""
+        ref_line = " · ".join(filter(None, [court, case, rap, str(date) if date else ""]))
+
+        with st.container(border=True):
+            top_left, top_right = st.columns([5, 1])
+            top_left.markdown(f"**{p['title']}**")
+            top_right.caption(owner_label)
+            if ref_line:
+                st.caption(ref_line)
+            tags = p.get("tags") or []
+            if tags:
+                st.caption("Tags: " + ", ".join(f"`{t}`" for t in tags))
+            st.caption(f"{p.get('total_chunks', 0)} blocos indexados")
+
+            cols = st.columns([1, 1, 4])
+            if cols[0].button("Ver", key=f"juris_view_{p['id']}", use_container_width=True):
+                st.session_state.juris_view_id = p["id"]
+                st.session_state.view = "view_jurisprudence"
+                st.rerun()
+            # Globais nao podem ser deletadas pelo usuario comum
+            if not is_global and p.get("user_id") == user_id:
+                if cols[1].button("Excluir", key=f"juris_del_{p['id']}", use_container_width=True):
+                    db.delete_jurisprudence(p["id"])
+                    st.success("Peca removida da biblioteca.")
+                    st.rerun()
+
+
+def render_add_jurisprudence():
+    """Formulario para adicionar nova peca a biblioteca (texto colado ou PDF)."""
+    col1, col2 = st.columns([4, 1])
+    col1.title("+ Adicionar jurisprudencia")
+    if col2.button("Voltar", use_container_width=True):
+        st.session_state.view = "library"
+        st.rerun()
+
+    st.caption(
+        "Cole o texto integral do acordao OU faca upload do PDF. O texto sera "
+        "indexado e ficara disponivel para o RAG fundamentar respostas."
+    )
+
+    metodo = st.radio(
+        "Como deseja adicionar?",
+        ["Colar texto", "Upload de PDF"],
+        horizontal=True,
+        key="juris_metodo",
+    )
+
+    with st.form("add_juris_form"):
+        title = st.text_input(
+            "Titulo *",
+            placeholder="Ex: STF, HC 126.292/SP - presuncao de inocencia",
+            max_chars=300,
+        )
+        c1, c2 = st.columns(2)
+        court = c1.text_input("Tribunal", placeholder="STF / STJ / TJSP / ...")
+        case_number = c2.text_input("Numero do processo", placeholder="HC 126.292/SP")
+
+        c3, c4 = st.columns(2)
+        rapporteur = c3.text_input("Relator(a)", placeholder="Min. Teori Zavascki")
+        judgment_date = c4.date_input(
+            "Data de julgamento",
+            value=None,
+            format="DD/MM/YYYY",
+        )
+
+        tags_str = st.text_input(
+            "Tags (separadas por virgula)",
+            placeholder="execucao penal, presuncao de inocencia, recurso",
+        )
+        source_url = st.text_input(
+            "Link da fonte (opcional)",
+            placeholder="https://...",
+        )
+
+        full_text = ""
+        uploaded_pdf = None
+        if metodo == "Colar texto":
+            full_text = st.text_area(
+                "Texto integral do acordao *",
+                height=400,
+                placeholder="Cole aqui o texto completo do acordao...",
+                max_chars=500000,
+            )
+        else:
+            uploaded_pdf = st.file_uploader(
+                "PDF do acordao *",
+                type=["pdf"],
+                accept_multiple_files=False,
+            )
+
+        submitted = st.form_submit_button(
+            "Indexar peca na biblioteca",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        return
+
+    # Validacao
+    if not title.strip():
+        st.error("Titulo e obrigatorio.")
+        return
+
+    # Carregar texto (texto direto ou extraido do PDF)
+    if metodo == "Colar texto":
+        if not full_text.strip() or len(full_text.strip()) < 100:
+            st.error("Texto integral muito curto. Cole o acordao completo.")
+            return
+        text_to_index = full_text
+    else:
+        if not uploaded_pdf:
+            st.error("Selecione um PDF.")
+            return
+        # Rate limit como upload tambem
+        if not _check_upload_rate_limit():
+            return
+        st.session_state._rl_upload_count += 1
+        try:
+            pdf_bytes = uploaded_pdf.getvalue()
+            pages = pdf_mod.extract_pages(pdf_bytes)
+        except ValueError as e:
+            st.error(str(e))
+            return
+        if not pages:
+            st.error("Nao foi possivel extrair texto do PDF (pode ser escaneado).")
+            return
+        text_to_index = "\n\n".join(p["text"] for p in pages)
+
+    tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else None
+
+    _index_jurisprudence(
+        title=title.strip(),
+        full_text=text_to_index,
+        court=court.strip() or None,
+        case_number=case_number.strip() or None,
+        rapporteur=rapporteur.strip() or None,
+        judgment_date=judgment_date.isoformat() if judgment_date else None,
+        tags=tags,
+        source_url=source_url.strip() or None,
+    )
+
+
+def _index_jurisprudence(**meta):
+    """Pipeline: chunkar texto -> criar peca -> embed chunks via Voyage."""
+    text = meta.pop("full_text")
+    # Reutiliza chunk_pages tratando o texto como uma pseudo-pagina (page_num=1)
+    pseudo_pages = [{"page_num": 1, "text": text}]
+    chunks = pdf_mod.chunk_pages(pseudo_pages)
+    if not chunks:
+        st.error("Texto resultou em zero blocos. Verifique se nao esta vazio.")
+        return
+
+    with st.status("Indexando jurisprudencia...", expanded=True) as status:
+        st.write(f"\u2702\ufe0f {len(chunks)} blocos preparados.")
+        st.write("\U0001f4be Registrando peca...")
+        juris_id = db.create_jurisprudence(
+            full_text=text,
+            total_chunks=len(chunks),
+            **meta,
+        )
+
+        st.write(f"\U0001f9e0 Gerando embeddings (voyage-law-2)...")
+        progress = st.progress(0.0)
+        def on_progress(done, total):
+            progress.progress(done / total if total else 1.0)
+        vec.embed_and_store_jurisprudence(juris_id, chunks, progress_cb=on_progress)
+        progress.progress(1.0)
+
+        status.update(label=f"Pronto! {len(chunks)} blocos indexados.", state="complete")
+
+    st.success("Peca adicionada a biblioteca.")
+    st.session_state.view = "library"
+    st.rerun()
+
+
+def render_view_jurisprudence():
+    """Visualiza o texto integral de uma peca da biblioteca."""
+    juris_id = st.session_state.get("juris_view_id")
+    if not juris_id:
+        st.session_state.view = "library"
+        st.rerun()
+        return
+
+    peca = db.get_jurisprudence(juris_id)
+    if not peca:
+        st.error("Peca nao encontrada.")
+        if st.button("Voltar"):
+            st.session_state.view = "library"
+            st.rerun()
+        return
+
+    col1, col2 = st.columns([4, 1])
+    col1.title(peca["title"])
+    if col2.button("Voltar", use_container_width=True):
+        st.session_state.view = "library"
+        st.session_state.juris_view_id = None
+        st.rerun()
+
+    court = peca.get("court") or ""
+    case = peca.get("case_number") or ""
+    rap = peca.get("rapporteur") or ""
+    date = peca.get("judgment_date") or ""
+    ref_line = " · ".join(filter(None, [court, case, rap, str(date) if date else ""]))
+    if ref_line:
+        st.caption(ref_line)
+
+    tags = peca.get("tags") or []
+    if tags:
+        st.caption("Tags: " + ", ".join(f"`{t}`" for t in tags))
+
+    url = peca.get("source_url")
+    if url:
+        st.caption(f"Fonte: {url}")
+
+    st.divider()
+    st.text_area(
+        "Texto integral",
+        value=peca.get("full_text", ""),
+        height=600,
+        disabled=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -698,7 +978,14 @@ else:
     else:
         # Fluxo normal do app
         render_sidebar()
-        if st.session_state.selected_process:
+        view = st.session_state.get("view", "main")
+        if view == "library":
+            render_library()
+        elif view == "add_jurisprudence":
+            render_add_jurisprudence()
+        elif view == "view_jurisprudence":
+            render_view_jurisprudence()
+        elif st.session_state.selected_process:
             render_chat()
         else:
             render_upload()

@@ -47,6 +47,7 @@ DADOS_TRATADOS = [
     "Perguntas e respostas do historico de conversa sobre o processo",
     "Registro de data e hora de acesso e operacoes realizadas (log de auditoria)",
     "Aceite do Termo de Consentimento (data e hora)",
+    "Conteudo e metadados das pecas de jurisprudencia adicionadas a sua biblioteca pessoal",
 ]
 
 DADOS_SENSIVEIS_TERCEIROS = (

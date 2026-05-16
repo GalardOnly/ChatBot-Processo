@@ -349,8 +349,70 @@ def delete_all_user_data() -> bool:
         # Fallback: deleta diretamente pela API
         try:
             client().table("processes").delete().eq("user_id", user_id).execute()
+            client().table("jurisprudence").delete().eq("user_id", user_id).execute()
             client().table("data_access_log").delete().eq("user_id", user_id).execute()
             client().table("lgpd_consents").delete().eq("user_id", user_id).execute()
             return True
         except Exception:
             return False
+
+
+# ---------------------------------------------------------------------------
+# Biblioteca de Jurisprudencia (pessoal por usuario)
+# ---------------------------------------------------------------------------
+
+def create_jurisprudence(
+    title: str,
+    full_text: str,
+    court: Optional[str] = None,
+    case_number: Optional[str] = None,
+    rapporteur: Optional[str] = None,
+    judgment_date: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    source_url: Optional[str] = None,
+    total_chunks: int = 0,
+) -> str:
+    """Cria uma nova peca de jurisprudencia para o usuario logado."""
+    user_id = current_user_id()
+    record = {
+        "user_id": user_id,
+        "title": title,
+        "full_text": full_text,
+        "total_chunks": total_chunks,
+    }
+    if court:         record["court"] = court
+    if case_number:   record["case_number"] = case_number
+    if rapporteur:    record["rapporteur"] = rapporteur
+    if judgment_date: record["judgment_date"] = judgment_date
+    if tags:          record["tags"] = tags
+    if source_url:    record["source_url"] = source_url
+
+    res = client().table("jurisprudence").insert(record).execute()
+    juris_id = res.data[0]["id"]
+    _log_access(action="add_jurisprudence")
+    return juris_id
+
+
+def list_jurisprudence() -> List[Dict]:
+    """Lista as pecas visiveis ao usuario (pessoais + globais)."""
+    res = client().table("jurisprudence") \
+        .select("id, user_id, title, court, case_number, rapporteur, judgment_date, tags, total_chunks, created_at") \
+        .order("created_at", desc=True) \
+        .execute()
+    return res.data or []
+
+
+def get_jurisprudence(juris_id: str) -> Optional[Dict]:
+    """Recupera uma peca completa (com full_text)."""
+    res = client().table("jurisprudence") \
+        .select("*") \
+        .eq("id", juris_id) \
+        .limit(1) \
+        .execute()
+    return res.data[0] if res.data else None
+
+
+def delete_jurisprudence(juris_id: str) -> None:
+    """Deleta uma peca (cascade limpa os chunks). RLS impede deletar globais."""
+    _log_access(action="delete_jurisprudence")
+    client().table("jurisprudence").delete().eq("id", juris_id).execute()
