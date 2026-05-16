@@ -132,12 +132,27 @@ def delete_process(process_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def list_messages(process_id: str) -> List[Dict]:
+    """
+    Lista mensagens do processo com o feedback do usuario embutido.
+    Cada item tem chave 'my_feedback' = {'rating', 'comment'} ou None.
+    """
+    user_id = current_user_id()
     res = client().table("messages") \
-        .select("role, content, sources, created_at") \
+        .select("id, role, content, sources, action_key, created_at, "
+                "message_feedback(rating, comment, user_id)") \
         .eq("process_id", process_id) \
         .order("created_at") \
         .execute()
-    return res.data or []
+    rows = res.data or []
+    for r in rows:
+        # Filtra feedbacks: so o do usuario logado importa para UI
+        fbs = r.pop("message_feedback", None) or []
+        mine = next((fb for fb in fbs if fb.get("user_id") == user_id), None)
+        r["my_feedback"] = (
+            {"rating": mine["rating"], "comment": mine.get("comment")}
+            if mine else None
+        )
+    return rows
 
 
 def save_message(
@@ -146,18 +161,24 @@ def save_message(
     content: str,
     sources: Optional[List[Dict]] = None,
     action_key: Optional[str] = None,
-) -> None:
-    client().table("messages").insert({
+) -> int:
+    """Insere uma mensagem e retorna o id (bigint) gerado."""
+    payload = {
         "user_id": current_user_id(),
         "process_id": process_id,
         "role": role,
         "content": content,
         "sources": sources,
-    }).execute()
+    }
+    if action_key:
+        payload["action_key"] = action_key
+    res = client().table("messages").insert(payload).execute()
+    msg_id = res.data[0]["id"] if res.data else None
     # Log LGPD: interacao com processo
     if role == "user":
         log_action = f"action_{action_key}" if action_key else "chat"
         _log_access(process_id=process_id, action=log_action)
+    return msg_id
 
 
 # ---------------------------------------------------------------------------
@@ -416,3 +437,55 @@ def delete_jurisprudence(juris_id: str) -> None:
     """Deleta uma peca (cascade limpa os chunks). RLS impede deletar globais."""
     _log_access(action="delete_jurisprudence")
     client().table("jurisprudence").delete().eq("id", juris_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# Feedback do usuario (avaliacao das respostas do assistente)
+# ---------------------------------------------------------------------------
+
+def save_feedback(
+    message_id: int,
+    rating: str,
+    comment: Optional[str] = None,
+) -> None:
+    """
+    Salva (upsert) o feedback do usuario para uma mensagem do assistente.
+    rating: 'positive' ou 'negative'.
+    """
+    if rating not in ("positive", "negative"):
+        raise ValueError("rating deve ser 'positive' ou 'negative'")
+
+    user_id = current_user_id()
+    if not user_id:
+        return
+
+    payload = {
+        "message_id": message_id,
+        "user_id": user_id,
+        "rating": rating,
+        "comment": comment,
+    }
+    try:
+        # upsert exige unique constraint (message_id, user_id) - definida no schema
+        client().table("message_feedback") \
+            .upsert(payload, on_conflict="message_id,user_id") \
+            .execute()
+        _log_access(action=f"feedback_{rating}")
+    except Exception:
+        pass
+
+
+def delete_feedback(message_id: int) -> None:
+    """Remove o voto do usuario para uma mensagem (caso ele queira retirar)."""
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        client().table("message_feedback") \
+            .delete() \
+            .eq("message_id", message_id) \
+            .eq("user_id", user_id) \
+            .execute()
+        _log_access(action="feedback_remove")
+    except Exception:
+        pass

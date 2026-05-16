@@ -495,10 +495,12 @@ def render_chat():
 
             st.markdown(msg["content"])
 
-            if msg["role"] == "assistant" and msg.get("sources"):
-                chunk_sources = [s for s in msg["sources"] if s.get("type") != "prescricao_engine"]
-                if chunk_sources:
-                    _render_sources(chunk_sources)
+            if msg["role"] == "assistant":
+                if msg.get("sources"):
+                    chunk_sources = [s for s in msg["sources"] if s.get("type") != "prescricao_engine"]
+                    if chunk_sources:
+                        _render_sources(chunk_sources)
+                _render_feedback_buttons(msg)
 
     pending_action = st.session_state.pop("pending_action", None)
     pending_question = st.session_state.pop("pending_question", None)
@@ -544,7 +546,8 @@ def _run_action_and_save(process_id: str, action_key: str):
     db.save_message(process_id, "user", user_message, action_key=action_key)
     with st.spinner(f"Executando: {action['label']}..."):
         answer, sources = chat_mod.run_action(process_id, action_key)
-    db.save_message(process_id, "assistant", answer, sources=sources)
+    # Persiste action_key tambem na resposta para suportar few-shot futuro
+    db.save_message(process_id, "assistant", answer, sources=sources, action_key=action_key)
 
 
 def _render_sources(sources):
@@ -555,6 +558,71 @@ def _render_sources(sources):
                 f"**fls. {s['page_num']}** · similaridade {score:.2f}\n\n"
                 f"> {s['excerpt']}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Feedback do usuario (👍/👎 nas respostas)
+# ---------------------------------------------------------------------------
+
+def _render_feedback_buttons(msg: dict):
+    """
+    Renderiza botoes de avaliacao para uma mensagem do assistente.
+    Estado vem de msg["my_feedback"] = {"rating": ..., "comment": ...} ou None.
+    """
+    msg_id = msg.get("id")
+    if msg_id is None:
+        return
+
+    current = msg.get("my_feedback")
+    current_rating = current["rating"] if current else None
+    ss_key_form = f"fb_form_{msg_id}"
+
+    cols = st.columns([1, 1, 6])
+
+    up_label = "👍 Útil" if current_rating != "positive" else "✅ Avaliado útil"
+    if cols[0].button(up_label, key=f"fb_up_{msg_id}", use_container_width=True):
+        db.save_feedback(msg_id, "positive", comment=None)
+        st.session_state.pop(ss_key_form, None)
+        st.toast("Obrigado pelo feedback.", icon="👍")
+        st.rerun()
+
+    down_label = "👎 Ruim" if current_rating != "negative" else "❌ Avaliado ruim"
+    if cols[1].button(down_label, key=f"fb_down_{msg_id}", use_container_width=True):
+        # Abre formulario de comentario opcional
+        st.session_state[ss_key_form] = True
+        st.rerun()
+
+    if current_rating:
+        if cols[2].button("Remover voto", key=f"fb_remove_{msg_id}"):
+            db.delete_feedback(msg_id)
+            st.session_state.pop(ss_key_form, None)
+            st.rerun()
+
+    # Formulario de comentario do voto negativo
+    if st.session_state.get(ss_key_form):
+        with st.form(f"fb_neg_form_{msg_id}"):
+            st.caption("O que tava ruim? (opcional, mas ajuda a melhorar os prompts)")
+            comment = st.text_area(
+                "Comentario",
+                key=f"fb_neg_comment_{msg_id}",
+                placeholder="Ex: inventou jurisprudencia / errou a pagina / faltou citar fls. X",
+                max_chars=1000,
+                label_visibility="collapsed",
+            )
+            csubmit, ccancel = st.columns(2)
+            if csubmit.form_submit_button("Enviar 👎", type="primary", use_container_width=True):
+                db.save_feedback(msg_id, "negative", comment=comment.strip() or None)
+                st.session_state.pop(ss_key_form, None)
+                st.toast("Feedback registrado.", icon="📝")
+                st.rerun()
+            if ccancel.form_submit_button("Cancelar", use_container_width=True):
+                st.session_state.pop(ss_key_form, None)
+                st.rerun()
+
+    # Mostra comentario antigo se existir
+    if current and current.get("comment"):
+        with st.expander("Seu comentario", expanded=False):
+            st.caption(current["comment"])
 
 
 # ---------------------------------------------------------------------------
